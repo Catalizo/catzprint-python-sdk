@@ -80,6 +80,8 @@ client.org_id()              # cached org id
 
 All helpers accept the routing and job options below and return a `Job`.
 
+Printer names aren't unique (two stations can each have a "Kitchen"), so target printers by ID. `client.printers.list()` returns each printer's `id`, `station_id`, `station_name`, `location_id` and `role`. Optional shortcut: in the CatzPrint console, open **Locations & stations** (**My devices** in a personal account), then a station, and click the ID under a printer's name to copy it.
+
 ```python
 client.print_text("Table 4: 2 x soup", printer_id="...")
 client.print_pdf("invoice.pdf", role="office")                 # path or bytes
