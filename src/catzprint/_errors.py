@@ -5,7 +5,7 @@ from __future__ import annotations
 import builtins
 import email.utils
 import time
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 __all__ = [
     "APIConnectionError",
@@ -14,13 +14,24 @@ __all__ = [
     "ConflictError",
     "NotFoundError",
     "OutOfPrintsError",
+    "OutcomeUnknownError",
     "PermissionDeniedError",
+    "PinMismatchError",
+    "PrinterError",
     "RateLimitError",
     "ServerError",
     "SignatureVerificationError",
+    "StationAttempt",
+    "StationUnreachableError",
     "ValidationError",
     "WaitTimeoutError",
     "error_from_response",
+    "is_cover_open",
+    "is_offline_allowance_exhausted",
+    "is_out_of_paper",
+    "is_outcome_unknown",
+    "is_printer_offline",
+    "is_station_unreachable",
 ]
 
 
@@ -101,6 +112,14 @@ class ServerError(CatzPrintError):
     """5xx: CatzPrint had a problem. Safe to retry idempotent requests later."""
 
 
+class PrinterError(CatzPrintError):
+    """503 from a CatzPrint station whose printer can't print right now.
+
+    ``code`` is ``printer_offline``, ``out_of_paper``, ``cover_open`` or ``printer_error``. The job was
+    not accepted; fix the printer and send it again (the SDK never falls back to the cloud for these).
+    """
+
+
 class APIConnectionError(CatzPrintError, builtins.ConnectionError):
     """The request never got an HTTP answer (DNS, refused connection, TLS, timeout)."""
 
@@ -122,6 +141,140 @@ class SignatureVerificationError(CatzPrintError):
     def __init__(self, message: str, *, header: Optional[str] = None) -> None:
         super().__init__(message, code="signature_verification_failed")
         self.header = header
+
+
+class PinMismatchError(CatzPrintError):
+    """A station presented a certificate whose SHA-256 fingerprint isn't the pinned one.
+
+    ``spki`` is True when the public-key (SubjectPublicKeyInfo) pin of a public hostname failed.
+    No request bytes were sent to that station.
+    """
+
+    def __init__(self, want: str, got: str, *, spki: bool = False) -> None:
+        what = "public key (SPKI) fingerprint" if spki else "certificate fingerprint"
+        super().__init__(f"The station's {what} {got} doesn't match the pinned {want}.", code="pin_mismatch")
+        self.want = want
+        self.got = got
+        self.spki = spki
+
+
+class StationAttempt:
+    """One station URL the SDK tried, and why it failed."""
+
+    __slots__ = ("error", "url")
+
+    def __init__(self, url: str, error: BaseException) -> None:
+        self.url = url
+        self.error = error
+
+    def __repr__(self) -> str:
+        return f"StationAttempt(url={self.url!r}, error={self.error!r})"
+
+
+class StationUnreachableError(CatzPrintError):
+    """No CatzPrint station on the local network could take the request.
+
+    None answered, the TLS check failed, the request timed out, a station answered 502/504 or 503
+    ``local_disabled``, or no local token could be obtained. ``code`` is ``station_unreachable``;
+    ``attempts`` lists what was tried (``urls`` just the URLs). In the fallback modes (``local_first``,
+    ``cloud_first``) ``cloud_error`` is the cloud's error when the cloud failed too (it is also the
+    exception's ``__cause__``).
+    """
+
+    def __init__(
+        self, attempts: Optional[List[StationAttempt]] = None, cloud_error: Optional[BaseException] = None
+    ) -> None:
+        super().__init__("No CatzPrint station could be reached.", code="station_unreachable")
+        self.attempts: List[StationAttempt] = list(attempts or [])
+        self.cloud_error = cloud_error
+
+    def add(self, url: str, error: BaseException) -> None:
+        self.attempts.append(StationAttempt(url, error))
+
+    @property
+    def urls(self) -> List[str]:
+        """The station URLs that were tried, in order."""
+        return [a.url for a in self.attempts if a.url]
+
+    @property
+    def message(self) -> str:
+        parts = []
+        for a in self.attempts:
+            why = str(a.error).rstrip(".")
+            parts.append(f"{a.url}: {why}" if a.url else why)
+        m = "No CatzPrint station could be reached"
+        m += ": " + "; ".join(parts) if parts else " (no station address known: set station_urls or discover)"
+        if self.cloud_error is not None:
+            m += f"; cloud fallback failed too: {str(self.cloud_error).rstrip('.')}"
+        return m + "."
+
+    @message.setter
+    def message(self, value: str) -> None:  # set by CatzPrintError.__init__; the text is computed
+        pass
+
+    def __str__(self) -> str:
+        return f"{self.code}: {self.message}"
+
+    def __repr__(self) -> str:
+        return f"StationUnreachableError(urls={self.urls!r}, cloud_error={self.cloud_error!r})"
+
+
+class OutcomeUnknownError(CatzPrintError):
+    """The job was fully sent, but no answer came back and its fate couldn't be confirmed.
+
+    ``code`` is ``outcome_unknown``. The station (``url``) or the cloud may have printed or queued it, so
+    the SDK did NOT try anywhere else. Retry later with the same ``idempotency_key``: that is always safe
+    (stations and the cloud dedupe on it). ``cause`` (also ``__cause__``) is the last error seen.
+    """
+
+    MESSAGE = "The station may have printed this job. Retry later with the same idempotency key."
+
+    def __init__(self, url: str, idempotency_key: str, cause: Optional[BaseException] = None) -> None:
+        super().__init__(self.MESSAGE, code="outcome_unknown")
+        self.url = url
+        self.idempotency_key = idempotency_key
+        self.cause = cause
+        self.__cause__ = cause
+
+    def __repr__(self) -> str:
+        return f"OutcomeUnknownError(url={self.url!r}, idempotency_key={self.idempotency_key!r}, cause={self.cause!r})"
+
+
+_PRINTER_CODES = frozenset({"printer_offline", "out_of_paper", "cover_open", "printer_error"})
+
+
+def _code(err: object) -> Optional[str]:
+    return err.code if isinstance(err, CatzPrintError) else None
+
+
+def is_printer_offline(err: object) -> bool:
+    """A station refused the job because the routed printer is offline."""
+    return _code(err) == "printer_offline"
+
+
+def is_out_of_paper(err: object) -> bool:
+    """The printer is out of paper."""
+    return _code(err) == "out_of_paper"
+
+
+def is_cover_open(err: object) -> bool:
+    """The printer's cover is open."""
+    return _code(err) == "cover_open"
+
+
+def is_offline_allowance_exhausted(err: object) -> bool:
+    """The station has been offline too long or has used its offline prints (402)."""
+    return _code(err) == "offline_allowance_exhausted"
+
+
+def is_outcome_unknown(err: object) -> bool:
+    """The job may or may not have printed (an :class:`OutcomeUnknownError`); retry with the same key."""
+    return isinstance(err, OutcomeUnknownError)
+
+
+def is_station_unreachable(err: object) -> bool:
+    """No station could be reached (a :class:`StationUnreachableError`)."""
+    return isinstance(err, StationUnreachableError)
 
 
 def parse_retry_after(value: Optional[str]) -> Optional[float]:
@@ -160,6 +313,9 @@ def error_from_response(status: int, body: Any, headers: Optional[Mapping[str, s
         raw_fields = err.get("fields")
         if isinstance(raw_fields, dict):
             fields = {str(k): str(v) for k, v in raw_fields.items()}
+        raw_param = err.get("param")  # stations (and some API errors) name the field in "param"
+        if not fields and isinstance(raw_param, str) and raw_param and message:
+            fields = {raw_param: message}
         ras = err.get("retry_after_seconds")
         if isinstance(ras, (int, float)) and not isinstance(ras, bool):
             retry_after = float(ras)
@@ -171,6 +327,8 @@ def error_from_response(status: int, body: Any, headers: Optional[Mapping[str, s
     cls: type = CatzPrintError
     if code == "out_of_prints" or status == 402:
         cls = OutOfPrintsError
+    elif code in _PRINTER_CODES:
+        cls = PrinterError
     elif status == 401:
         cls = AuthenticationError
     elif status == 403:

@@ -7,13 +7,14 @@ import json
 import logging
 import os
 import random
+import unicodedata
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Dict, Iterator, Mapping, Optional, Sequence, Tuple, Union
 from urllib.parse import quote, urlsplit
 
-from ._errors import AuthenticationError, CatzPrintError, error_from_response
+from ._errors import AuthenticationError, CatzPrintError, ValidationError, error_from_response
 from ._version import __version__
 
 logger = logging.getLogger("catzprint")
@@ -30,6 +31,10 @@ _LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
 JSONDict = Dict[str, Any]
 Content = Union[bytes, bytearray, memoryview]
+
+
+#: How long a fetched server key is used before it is fetched again (seconds); the server may rotate it.
+SERVER_KEY_TTL = 3600.0
 
 
 def check_base_url(url: str) -> str:
@@ -140,15 +145,17 @@ class ClientConfig:
         max_retries: int,
         backoff_base: float,
         max_backoff: float,
+        allow_no_key: bool = False,
     ) -> None:
         key = api_key if api_key is not None else os.environ.get("CATZPRINT_API_KEY", "")
         key = (key or "").strip()
-        if not key:
+        if not key and not allow_no_key:
             raise AuthenticationError(
-                "No API key. Pass api_key=... or set the CATZPRINT_API_KEY environment variable.",
+                "No API key. Pass api_key=... or set the CATZPRINT_API_KEY environment variable "
+                "(only a paired device in local mode, LocalConfig(mode='local', token='czd_…'), works without one).",
                 code="missing_api_key",
             )
-        if not key.startswith(("cz_live_", "cz_test_")):
+        if key and not key.startswith(("cz_live_", "cz_test_")):
             logger.warning("CatzPrint API keys start with cz_live_ or cz_test_; check the key you passed.")
         self._api_key = key
         url = base_url or os.environ.get("CATZPRINT_BASE_URL") or DEFAULT_BASE_URL
@@ -160,6 +167,24 @@ class ClientConfig:
     @property
     def api_key(self) -> str:
         return self._api_key
+
+    def require_key(self) -> None:
+        """Cloud calls of a client built without an API key (a paired device in local mode) fail."""
+        if not self._api_key:
+            raise AuthenticationError(
+                "This client has no API key (a paired device in local mode), so it can't call the CatzPrint API.",
+                code="missing_api_key",
+            )
+
+    def policy(self, max_retries: Optional[int]) -> RetryPolicy:
+        if max_retries is None:
+            return self.retry
+        return RetryPolicy(
+            max_retries=max(0, max_retries),
+            backoff_base=self.retry.backoff_base,
+            max_backoff=self.retry.max_backoff,
+            max_retry_after=self.retry.max_retry_after,
+        )
 
     @property
     def is_test_key(self) -> bool:
@@ -192,6 +217,8 @@ def decode_body(content: bytes, content_type: str) -> Any:
             return json.loads(content.decode("utf-8"))
         except ValueError:  # bad UTF-8, bad JSON, or an over-long integer literal
             pass
+        except RecursionError:
+            raise CatzPrintError("The response is nested too deeply to read.", code="invalid_response") from None
     return content.decode("utf-8", errors="replace")
 
 
@@ -213,6 +240,45 @@ def detect_kind(content: bytes, file_name: Optional[str]) -> str:
     if content.startswith(b"\x89PNG") or content.startswith(b"\xff\xd8\xff"):
         return "image"
     return "document"
+
+
+def mark_not_sent(err: CatzPrintError) -> CatzPrintError:
+    """Mark an error raised before the job POST was sent (org lookup, server key): NOT_DELIVERED."""
+    err.not_sent = True  # type: ignore[attr-defined]
+    return err
+
+
+def created_job(res: Any) -> JSONDict:
+    """The ``job`` of a create answer. A 2xx with an unreadable body is DELIVERED_NO_ANSWER: the job may
+    exist, so the error is marked ``delivered`` (the local modes retry with the same key)."""
+    job = res.get("job") if isinstance(res, dict) else None
+    if not isinstance(job, dict) or not isinstance(job.get("id"), str) or not job["id"]:
+        err = CatzPrintError(
+            "The API answered the job request with a body the SDK couldn't read.", code="invalid_response"
+        )
+        err.delivered = True  # type: ignore[attr-defined]
+        raise err
+    return job
+
+
+def check_idempotency_key(key: Optional[str]) -> Optional[str]:
+    """Validate a caller's idempotency key.
+
+    A key that is empty after trimming whitespace counts as no key (the SDK then generates one). A key
+    with leading/trailing whitespace or control characters is rejected rather than silently changed.
+    """
+    if key is None:
+        return None
+    if not isinstance(key, str):
+        raise ValidationError(
+            "idempotency_key must be a string.", code="invalid", fields={"idempotency_key": "Must be a string."}
+        )
+    if not key.strip():
+        return None
+    if key != key.strip() or any(unicodedata.category(ch) == "Cc" for ch in key):
+        msg = "idempotency_key must not have leading/trailing whitespace or control characters."
+        raise ValidationError(msg, code="invalid", fields={"idempotency_key": msg})
+    return key
 
 
 def new_idempotency_key() -> str:

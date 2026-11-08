@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "catzprint"
-version = "2.1.4"
+version = "2.2.1"
 description = "Official Python SDK for the CatzPrint cloud printing API (sync and async)."
 readme = "README.md"
 license = "MIT"
@@ -41,7 +41,9 @@ Documentation = "https://catzprint.com/docs"
 packages = ["src/catzprint"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src/catzprint", "tests", "examples", "README.md", "CHANGELOG.md", "LICENSE"]
+# Tests (and their test-only certificates and keys in tests/fixtures) are not shipped.
+include = ["src/catzprint", "examples", "README.md", "CHANGELOG.md", "LICENSE"]
+exclude = ["tests", "**/__pycache__"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

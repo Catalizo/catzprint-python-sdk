@@ -148,7 +148,7 @@ def test_headers_and_org_lookup_cached(server: FakeServer) -> None:
     assert len(server.calls("GET", "/v1/key")) == 1
     req = server.requests[0]
     assert req.headers["authorization"] == f"Bearer {KEY}"
-    assert req.headers["user-agent"] == "catzprint-python/2.1.3"
+    assert req.headers["user-agent"] == "catzprint-python/2.2.1"
 
 
 # ---------------------------------------------------------------- retries

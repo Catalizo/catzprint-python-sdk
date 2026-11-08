@@ -161,6 +161,21 @@ class Job:
     finished_at: Optional[datetime]
     events: List[JobEvent] = field(default_factory=list)
     raw: Dict[str, Any] = field(default_factory=dict, repr=False)
+    #: True when a station printed the job through its local API (directly, or reported later).
+    printed_locally: bool = False
+    #: Name of the device that sent a local job.
+    local_device: Optional[str] = None
+    #: Set on a job recorded by reconciliation when another job with the same key already printed.
+    duplicate_of: Optional[str] = None
+    #: True in webhook payloads when the station had no cloud connection when it printed.
+    offline: bool = False
+    #: The job's idempotency key, when the API or station reports it.
+    idempotency_key: Optional[str] = None
+    #: Set by the SDK: ``"local"`` when a station on the local network took the job, ``"cloud"`` when the
+    #: CatzPrint API did (``jobs.create`` and ``jobs.get`` fill it; ``None`` elsewhere).
+    via: Optional[str] = None
+    #: The station's own view of a local job (``via == "local"``), a :class:`catzprint.LocalJob`.
+    local: Any = field(default=None, repr=False)
 
     @property
     def is_final(self) -> bool:
@@ -197,6 +212,11 @@ class Job:
             finished_at=parse_time(d.get("finished_at")),
             events=[JobEvent.from_dict(e) for e in events if isinstance(e, dict)] if isinstance(events, list) else [],
             raw=dict(d),
+            printed_locally=_b(d, "printed_locally"),
+            local_device=_os(d, "local_device"),
+            duplicate_of=_os(d, "duplicate_of"),
+            offline=_b(d, "offline"),
+            idempotency_key=_os(d, "idempotency_key") or None,
         )
 
 

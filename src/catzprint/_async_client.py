@@ -6,30 +6,39 @@ import asyncio
 import os
 import time
 from datetime import datetime
-from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Mapping, Optional, Sequence, Union
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import httpx
 
+from ._async_local import AsyncLocal, AsyncLocalEndpoints, AsyncLocalManager, AsyncLocalTokens
 from ._base import (
     DEFAULT_MAX_RETRIES,
     DEFAULT_TIMEOUT,
     RETRY_STATUSES,
     SAFE_METHODS,
+    SERVER_KEY_TTL,
     ClientConfig,
     Content,
     ResponseTooLarge,
     api_error,
     aread_limited,
     build_job,
+    check_idempotency_key,
+    created_job,
     decode_body,
     list_params,
     logger,
+    mark_not_sent,
     read_file_arg,
     redact_key,
     seg,
     too_large_error,
 )
-from ._errors import APIConnectionError, CatzPrintError, WaitTimeoutError
+from ._errors import APIConnectionError, CatzPrintError, StationUnreachableError, WaitTimeoutError
+from ._local import NOT_DELIVERED_HTTPX
+from ._local_core import JobParams, LocalConfig, static_token_mode
+from ._local_models import VIA_CLOUD
+from ._local_transport import mark_delivered
 from ._models import ApiKeyInfo, Job, JobList, Location, Printer, Template
 from ._sealed import seal
 from .webhooks import Webhooks
@@ -57,19 +66,36 @@ class AsyncCatzPrint:
         backoff_base: float = 0.5,
         max_backoff: float = 8.0,
         http_client: Optional[httpx.AsyncClient] = None,
+        local: Optional[LocalConfig] = None,
     ) -> None:
-        self._config = ClientConfig(api_key, base_url, org_id, timeout, max_retries, backoff_base, max_backoff)
+        self._config = ClientConfig(
+            api_key,
+            base_url,
+            org_id,
+            timeout,
+            max_retries,
+            backoff_base,
+            max_backoff,
+            allow_no_key=static_token_mode(local),
+        )
         self._owns_http = http_client is None
         self._http = http_client or httpx.AsyncClient(timeout=timeout, follow_redirects=False)
         self._lock: Optional[asyncio.Lock] = None
         self._key_info: Optional[ApiKeyInfo] = None
+        self._server_key_gen = 0
         self._server_key: Optional[str] = None
+        self._server_key_at = 0.0
         self._sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
         self.jobs = AsyncJobs(self)
         self.printers = AsyncPrinters(self)
         self.locations = AsyncLocations(self)
         self.templates = AsyncTemplates(self)
         self.webhooks = Webhooks()
+        self.local_tokens = AsyncLocalTokens(self)
+        self.local_endpoints = AsyncLocalEndpoints(self)
+        self._local = AsyncLocalManager(self, local)
+        #: Stations on the local network (status, discovery, pairing, local jobs). See ``LocalConfig``.
+        self.local = AsyncLocal(self._local)
 
     # -- lifecycle -------------------------------------------------------
     async def aclose(self) -> None:
@@ -111,10 +137,14 @@ class AsyncCatzPrint:
         json: Any = None,
         idempotent: bool = False,
         auth: bool = True,
+        max_retries: Optional[int] = None,
+        timeout: Optional[float] = None,
+        on_ambiguous: Optional[Callable[[], None]] = None,
     ) -> Any:
+        self._config.require_key()
         url = self._config.base_url + path
         retryable = method.upper() in SAFE_METHODS or idempotent
-        policy = self._config.retry
+        policy = self._config.policy(max_retries)
         attempt = 0
         while True:
             try:
@@ -124,7 +154,7 @@ class AsyncCatzPrint:
                     params=params,
                     json=json,
                     headers=self._config.headers(auth),
-                    timeout=self._config.timeout,
+                    timeout=self._config.timeout if timeout is None else timeout,
                 ) as resp:
                     status = resp.status_code
                     resp_headers = resp.headers
@@ -133,6 +163,8 @@ class AsyncCatzPrint:
                 raise too_large_error(status) from None
             except httpx.HTTPError as e:
                 if policy.should_retry(attempt, retryable):
+                    if on_ambiguous is not None and not isinstance(e, NOT_DELIVERED_HTTPX):
+                        on_ambiguous()  # the failed attempt may have reached the API
                     delay = policy.delay(attempt)
                     logger.debug(
                         "catzprint %s %s failed (%s); retrying in %.2fs", method, path, type(e).__name__, delay
@@ -181,15 +213,29 @@ class AsyncCatzPrint:
     whoami = key
 
     async def server_public_key(self, *, refresh: bool = False) -> str:
-        """The server's X25519 public key (base64) used for sealed printing; cached."""
+        """The server's X25519 public key (base64) used for sealed printing. Cached for an hour (the
+        server may rotate it), and dropped at once when the API can't decrypt a sealed job."""
         async with self._get_lock():
-            if self._server_key is None or refresh:
+            stale = time.monotonic() - self._server_key_at >= SERVER_KEY_TTL
+            if self._server_key is None or refresh or stale:
+                gen = self._server_key_gen
                 res = await self._request("GET", "/v1/public/server-key", auth=False)
                 pk = res.get("public_key") if isinstance(res, dict) else None
                 if not isinstance(pk, str) or not pk:
                     raise CatzPrintError("The server didn't return a public key.")
-                self._server_key = pk
+                if gen == self._server_key_gen:
+                    # Only a fetch that started after the last drop installs its key: an older
+                    # in-flight fetch must not bring a dropped (rotated) key back.
+                    self._server_key = pk
+                    self._server_key_at = time.monotonic()
+                return pk
             return self._server_key
+
+    def _drop_server_key(self) -> None:
+        """Forget the cached server key (the API couldn't decrypt a sealed job)."""
+        self._server_key = None
+        self._server_key_at = 0.0
+        self._server_key_gen += 1
 
     # -- convenience helpers ----------------------------------------------
     async def print_text(self, text: str, **opts: Any) -> Job:
@@ -242,37 +288,88 @@ class AsyncJobs:
         file_name: Optional[str] = None,
         sealed: bool = False,
     ) -> Job:
-        """Create a print job. Give exactly one of ``text``, ``commands``, ``template_id`` or ``content``."""
-        draft = build_job(
-            printer_id=printer_id,
-            location_id=location_id,
-            role=role,
-            kind=kind,
-            title=title,
-            reference=reference,
-            copies=copies,
-            idempotency_key=idempotency_key,
-            scheduled_for=scheduled_for,
-            options=options,
-            text=text,
-            commands=commands,
-            template_id=template_id,
-            data=data,
-            content=content,
-            file_name=file_name,
-            sealed=sealed,
-        )
-        ciphertext = None
-        if draft.seal_payload is not None:
-            ciphertext = seal(await self._c.server_public_key(), draft.seal_payload)
-        body = draft.finish(ciphertext)
-        res = await self._c._request("POST", await self._c._org_path("/jobs"), json=body, idempotent=True)
-        return Job.from_dict(res["job"])
+        """Create a print job. Give exactly one of ``text``, ``commands``, ``template_id`` or ``content``.
+
+        With ``local=LocalConfig(...)`` in a mode other than ``cloud``, the job goes to a station on the
+        local network and/or the cloud as the mode says; ``job.via`` tells which one took it.
+        """
+        params: JobParams = {
+            "printer_id": printer_id,
+            "location_id": location_id,
+            "role": role,
+            "kind": kind,
+            "title": title,
+            "reference": reference,
+            "copies": copies,
+            "idempotency_key": check_idempotency_key(idempotency_key),
+            "scheduled_for": scheduled_for,
+            "options": options,
+            "text": text,
+            "commands": commands,
+            "template_id": template_id,
+            "data": data,
+            "content": content,
+            "file_name": file_name,
+            "sealed": sealed,
+        }
+        return await self._c._local.create(params)
+
+    async def _prepare_cloud(self, params: JobParams) -> Tuple[Dict[str, Any], str]:
+        draft = build_job(**params)
+        try:  # anything failing here happens before the job POST: the job is NOT_DELIVERED
+            ciphertext = None
+            if draft.seal_payload is not None:
+                ciphertext = seal(await self._c.server_public_key(), draft.seal_payload)
+            path = await self._c._org_path("/jobs")
+        except CatzPrintError as e:
+            raise mark_not_sent(e) from None
+        return draft.finish(ciphertext), path
+
+    async def _create_cloud(
+        self,
+        params: JobParams,
+        *,
+        max_retries: Optional[int] = None,
+        timeout: Optional[float] = None,
+        prepared: Optional[Dict[str, Any]] = None,
+        on_ambiguous: Optional[Callable[[], None]] = None,
+    ) -> Job:
+        """See ``Jobs._create_cloud``."""
+        if prepared is not None and "body" in prepared:
+            body, path = prepared["body"], prepared["path"]
+        else:
+            body, path = await self._prepare_cloud(params)
+            if prepared is not None:
+                prepared["body"], prepared["path"] = body, path
+        try:
+            res = await self._c._request(
+                "POST",
+                path,
+                json=body,
+                idempotent=True,
+                max_retries=max_retries,
+                timeout=timeout,
+                on_ambiguous=on_ambiguous,
+            )
+        except asyncio.CancelledError as ce:
+            mark_delivered(ce)  # the POST may already have reached the API (C6)
+            raise
+        job = Job.from_dict(created_job(res))
+        job.via = VIA_CLOUD
+        return job
+
+    async def _prepare_into(self, params: JobParams, prepared: Dict[str, Any]) -> None:
+        """See ``Jobs._prepare_into``."""
+        prepared["body"], prepared["path"] = await self._prepare_cloud(params)
 
     async def get(self, job_id: str) -> Job:
-        """Fetch a job, with its ``events`` history."""
+        """Fetch a job, with its ``events`` history. Local job IDs (``lj_…``) are read from the station."""
+        if job_id.startswith("lj_"):
+            return await self._c.local.get_job(job_id)
         res = await self._c._request("GET", await self._c._org_path(f"/jobs/{seg(job_id)}"))
-        return Job.from_dict(res["job"], res.get("events"))
+        job = Job.from_dict(res["job"], res.get("events"))
+        job.via = VIA_CLOUD
+        return job
 
     async def list(
         self,
@@ -367,13 +464,22 @@ class AsyncJobs:
         if not interval or interval <= 0 or interval != interval:
             interval = 1.0  # never poll in a tight loop
         deadline = time.monotonic() + timeout
+        last: Optional[Job] = None
         while True:
-            job = await self.get(job_id)
-            if job.is_final:
-                return job
+            try:
+                job: Optional[Job] = await self.get(job_id)
+            except StationUnreachableError:
+                if not job_id.startswith("lj_"):
+                    raise
+                job = None  # a local job's station is briefly unreachable: keep polling until the deadline
+            if job is not None:
+                if job.is_final:
+                    return job
+                last = job
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise WaitTimeoutError(f"Job {job_id} is still {job.status} after {timeout:g}s.", job=job)
+                status = last.status if last is not None else "unknown"
+                raise WaitTimeoutError(f"Job {job_id} is still {status} after {timeout:g}s.", job=last)
             await self._c._sleep(min(interval, remaining))
 
     async def print_text(self, text: str, **opts: Any) -> Job:

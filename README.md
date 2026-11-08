@@ -8,6 +8,7 @@ templates to any printer connected through a CatzPrint station, from a sync or a
 - Safe automatic retries with idempotency keys
 - Webhook signature verification
 - Optional end-to-end sealed printing (NaCl sealed box)
+- Local printing through the CatzPrint station on your network, also while the internet is down
 - Python 3.9+
 
 ## Install
@@ -39,6 +40,7 @@ client = CatzPrint(
     org_id=None,                            # default: looked up once with GET /v1/key
     timeout=30.0,                           # seconds per request
     max_retries=2,                          # retries on network errors, 429, 502, 503, 504
+    local=None,                             # LocalConfig(...): see "Local printing (offline)"
 )
 ```
 
@@ -167,6 +169,221 @@ client.print_receipt([
 ], role="receipt")
 ```
 
+## Local printing (offline)
+
+A restaurant must print when its internet is down. With `local=LocalConfig(...)`, the SDK sends jobs
+straight to the CatzPrint Station (desktop or Android) on the same network (its local API on port 7443), and the
+station reports everything it printed offline to the cloud when it's back: one job per idempotency key,
+billed, with webhooks (`job.printed_locally`, `job.offline`, `job.duplicate_of`).
+
+```python
+from catzprint import CatzPrint, FileTokenStore, LocalConfig
+from catzprint import commands as c
+
+client = CatzPrint(
+    "cz_live_...",                                   # or CATZPRINT_API_KEY
+    local=LocalConfig(
+        mode="local_first",
+        location_id=location_id,
+        discover=True,                               # the cloud's endpoint list + mDNS on the LAN
+        token_store=FileTokenStore("/var/lib/catzserve/catzprint-local.json"),
+        device_name="CatzServe hub",
+    ),
+)
+
+# A kitchen ticket: an inverted ALLERGY banner, then the order.
+job = client.jobs.create(
+    role="kitchen",
+    reference=f"order-{order.id}",
+    # One key per ticket and attempt: the station and the cloud both dedupe on it,
+    # so a fallback or a retry never prints twice.
+    idempotency_key=f"order-{order.id}-kitchen-r1",
+    commands=[
+        c.text(" ALLERGY: PEANUTS ", align="center", bold=True, invert=True, size=2),
+        c.text("Table 12", bold=True, size=2),
+        c.line(),
+        c.columns(c.column("2 x", 0.15), c.column("Pad thai", bold=True)),
+        c.text("   no egg"),
+        c.cut(),
+    ],
+)
+
+# Or a saved template with data (templates are synced to the station):
+job = client.jobs.create(
+    role="kitchen",
+    template_id=kitchen_template_id,
+    data={"table": "12", "items": items},
+    idempotency_key=f"order-{order.id}-kitchen-r1",
+)
+print(job.id, job.status, job.via, job.live)  # lj_… queued local True   (or … cloud)
+```
+
+`AsyncCatzPrint(local=LocalConfig(...))` works the same way (`await client.jobs.create(...)`).
+
+### Modes
+
+| Mode | Behaviour |
+|---|---|
+| `"cloud"` (default) | Unchanged: every job goes to the API. |
+| `"local"` | Stations only. No station → `StationUnreachableError`. |
+| `"local_first"` | Stations first; the cloud **only** when no station can be reached. |
+| `"cloud_first"` | Cloud first (`cloud_timeout`); stations only when the job surely didn't reach the cloud (connect/TLS errors, `502`/`503`/`504`). A 4xx (validation, 402, 429…) is raised, not retried locally. |
+
+(`catzprint.MODE_CLOUD`, `MODE_LOCAL`, `MODE_LOCAL_FIRST`, `MODE_CLOUD_FIRST` are the same strings.)
+
+In `local_first` the SDK falls back to the cloud only when the stations are **unreachable**:
+connection, TLS or timeout errors, `502`/`504`, and `503 local_disabled` (or a `503` without a code).
+A station that answers is never second-guessed: these are raised to you, never sent to the cloud:
+
+| Station answer | Python |
+|---|---|
+| `503 printer_offline` / `out_of_paper` / `cover_open` / `printer_error` (not accepted, not counted) | `PrinterError`, `is_printer_offline`, `is_out_of_paper`, `is_cover_open` |
+| `422 no_printer` / `invalid` / `unsupported_locally` / `test_raw_not_allowed`, `400` | `ValidationError` |
+| `402 offline_allowance_exhausted` (offline too long / offline prints used), `402 test_limit` | `OutOfPrintsError`, `is_offline_allowance_exhausted` |
+| `403 device_not_approved` / `forbidden_location` | `PermissionDeniedError` |
+| `409 duplicate`, `429 rate_limited` | `ConflictError`, `RateLimitError` |
+
+**Never printed twice on an ambiguous outcome.** The SDK tells apart a job that surely didn't arrive
+(DNS, connect, TLS or pin errors, a failed org-ID or server-key lookup, anything before the whole
+request was written, and a station's `502`/`504`/`503 local_disabled`) from one that was sent but got
+no usable answer (timeout, connection reset, a `2xx` whose body isn't a readable job, a too large
+answer, a redirect):
+
+- Not delivered: the next station, then (in `local_first`) the cloud, as above.
+- Sent to a station, no answer: the SDK asks **that same station** for the job by its key
+  (`GET /local/v1/jobs?idempotency_key=…`, up to 3 times within 5 s, same pinning). Found → that job is
+  the result. `404 not_found` → the station never recorded it, so it counts as not delivered.
+  `409 duplicate` → the key belongs to a job you can't see: that `ConflictError` is raised (no other
+  station, no cloud). `409 in_progress` → not done yet, keep asking. Anything else, or still no answer →
+  `OutcomeUnknownError` (code `outcome_unknown`, with `url` and `idempotency_key`): *"The station may
+  have printed this job. Retry later with the same idempotency key."* Nothing else is tried.
+- The cloud (`cloud_first`, and the cloud leg of `local_first`): not delivered or `502`/`503`/`504` →
+  the stations (`cloud_first`) or a `StationUnreachableError` carrying the cloud error (`local_first`).
+  Sent but no answer, or any other `5xx` (`500`, `501`, …) → **one** retry with the same key (the cloud
+  dedupes on it); if that is ambiguous or unavailable again → `OutcomeUnknownError`, never the stations
+  (the cloud may already have queued the job for another one). Any other cloud answer (a `4xx`) is
+  raised as it is, also in `local_first` after the stations were unreachable.
+- A station that answers the job POST itself with `409 in_progress` (the same key is being processed) is
+  asked by key in the same way. Once any answer for the key (the POST or a probe) said `in_progress`, a
+  `404` means "not recorded yet": no answer within the budget → `OutcomeUnknownError`, never a fallback.
+- A cloud `409 duplicate` (e.g. "being created": another request with the same key is in progress), in
+  any mode: the identical request (same body, same seal) is sent again after 1 s, up to 3 times. Still
+  `409` → that `ConflictError` is raised. A re-send that isn't delivered or is ambiguous → `OutcomeUnknownError`.
+- A cloud `400`/`422` naming `sealed_content` (the server key was rotated): the SDK drops the cached server
+  key, fetches it again, re-seals and re-sends **once** with the same key. After an ambiguous attempt (an
+  answer lost, a client retry, a `409`), a failed key fetch or a re-send that is rejected again, not
+  delivered or ambiguous → `OutcomeUnknownError` (never a `ValidationError`, never the stations); without
+  one, a repeated rejection is raised as the `ValidationError`.
+- Cancelling an `AsyncCatzPrint` call (task cancel, `asyncio.wait_for` / `asyncio.timeout`) after the
+  job was fully written to a station, while asking a station for it by key, or while the cloud POST was in
+  flight in the local modes, raises `OutcomeUnknownError` wrapping the `CancelledError` (`e.cause`), never
+  a fallback; cancelled before anything was written, you get the `CancelledError` itself. (The sync
+  client has no cancellation; its timeouts apply.)
+
+Retrying with the same idempotency key is always safe: stations and the cloud print a key once.
+Check with `is_outcome_unknown(e)`.
+
+A `401 token_expired` makes the SDK mint a fresh token once and retry (at most once per 10 minutes).
+Any other `401` (`device_revoked`, `unauthenticated`), or a token that can't be renewed because the
+cloud is down too: `local_first` uses the cloud and `local` raises the `AuthenticationError`.
+
+The local modes always send an idempotency key; when you don't set one the SDK uses `"sdk-<uuid4>"`
+and sends the **same** key to the station and the cloud. If a station printed a job and the cloud
+later gets the same key, the cloud merges them instead of printing again. Use your own keys (like
+`order-1042-kitchen-r1`) so your own retries are safe too. A key that is empty after trimming
+whitespace counts as no key; a key with leading/trailing whitespace or control characters raises a
+`ValidationError` (it is never silently changed).
+
+Jobs that can't print locally (PDFs, images, Office documents, sealed or scheduled jobs) go straight
+to the cloud in `local_first`/`cloud_first`, exactly as in mode `cloud` (the client's retries and
+timeout, the `409` re-sends), and raise a `ValidationError` with code
+`unsupported_locally` in `local` mode. When a job sets neither `printer_id` nor `location_id`,
+`LocalConfig.location_id` is used.
+
+```python
+from catzprint import StationUnreachableError, is_out_of_paper, is_printer_offline
+
+try:
+    job = client.jobs.create(role="kitchen", text="...", idempotency_key=key)
+except Exception as e:
+    if is_printer_offline(e) or is_out_of_paper(e):
+        ...  # tell the staff; retry later with the same key
+    elif isinstance(e, StationUnreachableError):
+        print("tried", e.urls, "cloud:", e.cloud_error)  # e.attempts: (url, error) pairs
+    else:
+        raise
+```
+
+### Finding and trusting stations
+
+Stations are tried in this order: `station_urls`, then (with `discover=True`) the URLs from the
+cloud's endpoint list (public-certificate hostnames before raw IPs), then current addresses found over
+mDNS (`_catzprint._tcp`), browsed only when the others failed.
+
+- **Public hostnames** (`https://192-168-1-20.<label>.local.catzprint.com:7443`) come **only** from
+  the cloud endpoint list. They carry a Let's Encrypt certificate, verified like any website, **and**
+  the certificate's public key must match the `public_spki_sha256` the cloud reports. The SDK
+  connects to the IP in the name directly (so they work while public DNS is down) only for names
+  under that station's own label.
+- **IP URLs** are trusted **only** with a pinned SHA-256 fingerprint of the station's self-signed
+  certificate: from the cloud endpoint list or `LocalConfig.fingerprints` (the station app shows it).
+  Only private addresses (RFC 1918, IPv6 ULA, link-local) are used. Nothing is trusted on first use.
+  The fingerprint is checked right after the TLS handshake, **before** any request byte (or token)
+  is sent.
+- **mDNS is never trusted on its own.** It only maps a station ID to its current address, for a
+  station on the cloud endpoint list (pinned with the list's fingerprint) or one whose announced
+  fingerprint is in `fingerprints`. The announced hostname is ignored. So a device on the LAN can't
+  pose as your station, even with its own valid CatzPrint certificate.
+
+The local token (`czl1…`) is minted with your API key (`POST /v1/orgs/{org}/local-tokens`, scope
+`jobs:write`) and **bound to `location_id`** (required unless you set `all_locations=True`). It is
+cached in the `token_store` with the endpoint list. There is no background thread: when the SDK uses
+the token and it has less than min(7 days, half its lifetime) left (or the endpoint list is older than an hour), it renews
+them right after that call, while online (a failed renewal is retried 5 minutes later; the old token
+keeps working meanwhile). A station's `401 token_expired` causes one fresh mint and a retry, at most
+once per 10 minutes per device (remembered in the store); `401 device_revoked` (the device was
+revoked in the station app) is never answered with a new token. `FileTokenStore(path)` writes the
+file with mode 0600 through an atomic rename, and refuses (POSIX) an existing file or directory that
+isn't owned by the current user or is group/world-writable (error code `token_store_insecure`, see
+`client.local.store_error`; printing goes on with the token in memory); the default store is in memory (`MemoryTokenStore`).
+Your own store only needs `load(key) -> StoredToken | None` and `save(key, StoredToken | None)`.
+
+Timeouts (seconds): `connect_timeout` (3, TLS included), `request_timeout` (15), `cloud_timeout`
+(10: the cloud attempt in `cloud_first`, minting, refreshes), `discover_timeout` (1.5). `wait` (up to
+30) asks the station to answer once the job printed or failed. Cancelling an async call never falls
+back (see above). `ca_file` / `ca_data` replace the system roots for public station hostnames.
+
+### Local helpers
+
+```python
+st = client.local.status()               # printers, paper, unsynced jobs, offline allowance
+stations = client.local.discover()       # endpoint list + mDNS, merged
+info = client.local.info(url)            # GET /local/v1/info
+job = client.jobs.get("lj_…")            # local job IDs are read from the station (wait_for works too)
+client.local.refresh()                   # renew token / endpoint list now
+tok = client.local.token()               # the czl1 token, e.g. for a browser POS
+
+# Pair a device with one station using the 8-digit code and the certificate fingerprint shown in the
+# station app (or a station on the cloud endpoint list); the czd_ token works without any cloud
+# account or API key.
+p = client.local.pair("https://192.168.1.20:7443", "12345678", "Till 3", fingerprint="3f1a…")
+
+# A paired till needs no API key: local mode with the device token.
+till = CatzPrint(local=LocalConfig(
+    mode="local",
+    station_urls=["https://192.168.1.20:7443"],
+    fingerprints={"192.168.1.20": "3f1a…"},
+    token=p.token,
+))
+# (its cloud calls raise an AuthenticationError with code missing_api_key)
+
+lt = client.local_tokens.create(device_name="Till 3", location_ids=[loc], ttl_days=30)
+client.local_tokens.revoke(lt.token_id)
+eps = client.local_endpoints.list(loc)
+```
+
+See [`examples/local_hub.py`](examples/local_hub.py) for a complete hub.
+
 ## Errors
 
 Every error is a `catzprint.CatzPrintError` with `status`, `code`, `message`, `fields` and `retry_after`.
@@ -184,6 +401,10 @@ Every error is a `catzprint.CatzPrintError` with `status`, `code`, `message`, `f
 | `APIConnectionError` (alias `catzprint.ConnectionError`) | network error or timeout |
 | `WaitTimeoutError` (alias `catzprint.TimeoutError`) | `jobs.wait_for` timed out; `e.job` is the last state |
 | `SignatureVerificationError` | webhook signature didn't verify |
+| `PrinterError` | a station's printer is offline, out of paper, open or in error (503) |
+| `StationUnreachableError` | no station could be reached (`e.attempts`, `e.urls`, `e.cloud_error`) |
+| `OutcomeUnknownError` | `outcome_unknown`: the job was sent but its fate is unknown; retry later with the same key (`e.url`, `e.idempotency_key`) |
+| `PinMismatchError` | (in `e.attempts`) a station's certificate didn't match its pinned fingerprint |
 
 ```python
 from catzprint import CatzPrintError, ValidationError
@@ -285,7 +506,8 @@ the server sends.
 ## Sealed printing
 
 With `sealed=True` the SDK encrypts the text or file on your machine to the CatzPrint server's public key
-(`GET /v1/public/server-key`, fetched once and cached) using a NaCl sealed box
+(`GET /v1/public/server-key`, cached for an hour; fetched again and re-sealed once if the API can't
+decrypt the job because the key was rotated) using a NaCl sealed box
 (X25519 + XSalsa20-Poly1305), and sends it as `sealed_content`. The server re-seals it to the
 station's key, so the document is never sent in the clear. Requires `pip install "catzprint[sealed]"`.
 
@@ -307,7 +529,7 @@ Receipt commands and templates are rendered by the server and can't be sealed.
 
 ## Examples
 
-See [`examples/`](examples): `print_receipt.py`, `print_pdf_and_wait.py`, `verify_webhook.py`.
+See [`examples/`](examples): `print_receipt.py`, `print_pdf_and_wait.py`, `verify_webhook.py`, `local_hub.py`.
 
 ## Development
 

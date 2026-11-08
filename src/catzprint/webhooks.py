@@ -140,7 +140,7 @@ def verify(
     verify_signature(payload, signature_header, secret, tolerance=tolerance, now=now)
     try:
         data = json.loads(_to_bytes(payload).decode("utf-8"))
-    except ValueError as e:  # bad UTF-8, bad JSON, or an over-long integer literal
+    except (ValueError, RecursionError) as e:  # bad UTF-8/JSON, an over-long integer, too deeply nested
         raise SignatureVerificationError("Webhook payload isn't valid JSON.", header=signature_header) from e
     if not isinstance(data, dict):
         raise SignatureVerificationError("Webhook payload isn't a JSON object.", header=signature_header)

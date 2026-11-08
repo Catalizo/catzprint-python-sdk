@@ -6,7 +6,7 @@ import os
 import threading
 import time
 from datetime import datetime
-from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Union
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple, Union
 
 import httpx
 
@@ -14,14 +14,18 @@ from ._base import (
     DEFAULT_MAX_RETRIES,
     DEFAULT_TIMEOUT,
     SAFE_METHODS,
+    SERVER_KEY_TTL,
     ClientConfig,
     Content,
     ResponseTooLarge,
     api_error,
     build_job,
+    check_idempotency_key,
+    created_job,
     decode_body,
     list_params,
     logger,
+    mark_not_sent,
     read_file_arg,
     read_limited,
     redact_key,
@@ -29,7 +33,10 @@ from ._base import (
     too_large_error,
 )
 from ._base import RETRY_STATUSES as _RETRY_STATUSES
-from ._errors import APIConnectionError, CatzPrintError, WaitTimeoutError
+from ._errors import APIConnectionError, CatzPrintError, StationUnreachableError, WaitTimeoutError
+from ._local import NOT_DELIVERED_HTTPX, Local, LocalEndpoints, LocalManager, LocalTokens
+from ._local_core import JobParams, LocalConfig, static_token_mode
+from ._local_models import VIA_CLOUD
 from ._models import ApiKeyInfo, Job, JobList, Location, Printer, Template
 from ._sealed import seal
 from .webhooks import Webhooks
@@ -57,19 +64,36 @@ class CatzPrint:
         backoff_base: float = 0.5,
         max_backoff: float = 8.0,
         http_client: Optional[httpx.Client] = None,
+        local: Optional[LocalConfig] = None,
     ) -> None:
-        self._config = ClientConfig(api_key, base_url, org_id, timeout, max_retries, backoff_base, max_backoff)
+        self._config = ClientConfig(
+            api_key,
+            base_url,
+            org_id,
+            timeout,
+            max_retries,
+            backoff_base,
+            max_backoff,
+            allow_no_key=static_token_mode(local),
+        )
         self._owns_http = http_client is None
         self._http = http_client or httpx.Client(timeout=timeout, follow_redirects=False)
         self._lock = threading.Lock()
         self._key_info: Optional[ApiKeyInfo] = None
+        self._server_key_gen = 0
         self._server_key: Optional[str] = None
+        self._server_key_at = 0.0
         self._sleep: Callable[[float], None] = time.sleep
         self.jobs = Jobs(self)
         self.printers = Printers(self)
         self.locations = Locations(self)
         self.templates = Templates(self)
         self.webhooks = Webhooks()
+        self.local_tokens = LocalTokens(self)
+        self.local_endpoints = LocalEndpoints(self)
+        self._local = LocalManager(self, local)
+        #: Stations on the local network (status, discovery, pairing, local jobs). See ``LocalConfig``.
+        self.local = Local(self._local)
 
     # -- lifecycle -------------------------------------------------------
     def close(self) -> None:
@@ -104,10 +128,14 @@ class CatzPrint:
         json: Any = None,
         idempotent: bool = False,
         auth: bool = True,
+        max_retries: Optional[int] = None,
+        timeout: Optional[float] = None,
+        on_ambiguous: Optional[Callable[[], None]] = None,
     ) -> Any:
+        self._config.require_key()
         url = self._config.base_url + path
         retryable = method.upper() in SAFE_METHODS or idempotent
-        policy = self._config.retry
+        policy = self._config.policy(max_retries)
         attempt = 0
         while True:
             try:
@@ -117,7 +145,7 @@ class CatzPrint:
                     params=params,
                     json=json,
                     headers=self._config.headers(auth),
-                    timeout=self._config.timeout,
+                    timeout=self._config.timeout if timeout is None else timeout,
                 ) as resp:
                     status = resp.status_code
                     resp_headers = resp.headers
@@ -126,6 +154,8 @@ class CatzPrint:
                 raise too_large_error(status) from None
             except httpx.HTTPError as e:
                 if policy.should_retry(attempt, retryable):
+                    if on_ambiguous is not None and not isinstance(e, NOT_DELIVERED_HTTPX):
+                        on_ambiguous()  # the failed attempt may have reached the API
                     delay = policy.delay(attempt)
                     logger.debug(
                         "catzprint %s %s failed (%s); retrying in %.2fs", method, path, type(e).__name__, delay
@@ -174,15 +204,29 @@ class CatzPrint:
     whoami = key
 
     def server_public_key(self, *, refresh: bool = False) -> str:
-        """The server's X25519 public key (base64) used for sealed printing; cached."""
+        """The server's X25519 public key (base64) used for sealed printing. Cached for an hour (the
+        server may rotate it), and dropped at once when the API can't decrypt a sealed job."""
         with self._lock:
-            if self._server_key is None or refresh:
+            stale = time.monotonic() - self._server_key_at >= SERVER_KEY_TTL
+            if self._server_key is None or refresh or stale:
+                gen = self._server_key_gen
                 res = self._request("GET", "/v1/public/server-key", auth=False)
                 pk = res.get("public_key") if isinstance(res, dict) else None
                 if not isinstance(pk, str) or not pk:
                     raise CatzPrintError("The server didn't return a public key.")
-                self._server_key = pk
+                if gen == self._server_key_gen:
+                    # Only a fetch that started after the last drop installs its key: an older
+                    # in-flight fetch must not bring a dropped (rotated) key back.
+                    self._server_key = pk
+                    self._server_key_at = time.monotonic()
+                return pk
             return self._server_key
+
+    def _drop_server_key(self) -> None:
+        """Forget the cached server key (the API couldn't decrypt a sealed job)."""
+        self._server_key = None
+        self._server_key_at = 0.0
+        self._server_key_gen += 1
 
     # -- convenience helpers ----------------------------------------------
     def print_text(self, text: str, **opts: Any) -> Job:
@@ -239,37 +283,86 @@ class Jobs:
 
         An idempotency key is generated when you don't pass one, so the
         request is retried safely on network errors and 429/502/503/504.
+
+        With ``CatzPrint(local=LocalConfig(...))`` in a mode other than ``cloud``, the job goes to a
+        station on the local network and/or the cloud as the mode says; ``job.via`` tells which one took
+        it. In the local modes the same idempotency key (``"sdk-<uuid4>"`` when you set none) goes to
+        the station and the cloud, so a fallback never prints twice.
         """
-        draft = build_job(
-            printer_id=printer_id,
-            location_id=location_id,
-            role=role,
-            kind=kind,
-            title=title,
-            reference=reference,
-            copies=copies,
-            idempotency_key=idempotency_key,
-            scheduled_for=scheduled_for,
-            options=options,
-            text=text,
-            commands=commands,
-            template_id=template_id,
-            data=data,
-            content=content,
-            file_name=file_name,
-            sealed=sealed,
+        params: JobParams = {
+            "printer_id": printer_id,
+            "location_id": location_id,
+            "role": role,
+            "kind": kind,
+            "title": title,
+            "reference": reference,
+            "copies": copies,
+            "idempotency_key": check_idempotency_key(idempotency_key),
+            "scheduled_for": scheduled_for,
+            "options": options,
+            "text": text,
+            "commands": commands,
+            "template_id": template_id,
+            "data": data,
+            "content": content,
+            "file_name": file_name,
+            "sealed": sealed,
+        }
+        return self._c._local.create(params)
+
+    def _prepare_cloud(self, params: JobParams) -> Tuple[Dict[str, Any], str]:
+        draft = build_job(**params)
+        try:  # anything failing here happens before the job POST: the job is NOT_DELIVERED
+            ciphertext = None
+            if draft.seal_payload is not None:
+                ciphertext = seal(self._c.server_public_key(), draft.seal_payload)
+            path = self._c._org_path("/jobs")
+        except CatzPrintError as e:
+            raise mark_not_sent(e) from None
+        return draft.finish(ciphertext), path
+
+    def _create_cloud(
+        self,
+        params: JobParams,
+        *,
+        max_retries: Optional[int] = None,
+        timeout: Optional[float] = None,
+        prepared: Optional[Dict[str, Any]] = None,
+        on_ambiguous: Optional[Callable[[], None]] = None,
+    ) -> Job:
+        """Create the job in the cloud. ``prepared`` (a dict the caller keeps) holds the body and path
+        after the first call, so re-sends are byte-identical (a sealed job isn't sealed again)."""
+        if prepared is not None and "body" in prepared:
+            body, path = prepared["body"], prepared["path"]
+        else:
+            body, path = self._prepare_cloud(params)
+            if prepared is not None:
+                prepared["body"], prepared["path"] = body, path
+        res = self._c._request(
+            "POST",
+            path,
+            json=body,
+            idempotent=True,
+            max_retries=max_retries,
+            timeout=timeout,
+            on_ambiguous=on_ambiguous,
         )
-        ciphertext = None
-        if draft.seal_payload is not None:
-            ciphertext = seal(self._c.server_public_key(), draft.seal_payload)
-        body = draft.finish(ciphertext)
-        res = self._c._request("POST", self._c._org_path("/jobs"), json=body, idempotent=True)
-        return Job.from_dict(res["job"])
+        job = Job.from_dict(created_job(res))
+        job.via = VIA_CLOUD
+        return job
+
+    def _prepare_into(self, params: JobParams, prepared: Dict[str, Any]) -> None:
+        """Build (and seal) the create into ``prepared`` for the re-sends that follow."""
+        prepared["body"], prepared["path"] = self._prepare_cloud(params)
 
     def get(self, job_id: str) -> Job:
-        """Fetch a job, with its ``events`` history."""
+        """Fetch a job, with its ``events`` history. Local job IDs (``lj_…``) are read from the station."""
+        if job_id.startswith("lj_"):
+            return self._c.local.get_job(job_id)
         res = self._c._request("GET", self._c._org_path(f"/jobs/{seg(job_id)}"))
-        return Job.from_dict(res["job"], res.get("events"))
+        job = Job.from_dict(res["job"], res.get("events"))
+        job.via = VIA_CLOUD
+        return job
 
     def list(
         self,
@@ -364,13 +457,22 @@ class Jobs:
         if not interval or interval <= 0 or interval != interval:
             interval = 1.0  # never poll in a tight loop
         deadline = time.monotonic() + timeout
+        last: Optional[Job] = None
         while True:
-            job = self.get(job_id)
-            if job.is_final:
-                return job
+            try:
+                job: Optional[Job] = self.get(job_id)
+            except StationUnreachableError:
+                if not job_id.startswith("lj_"):
+                    raise
+                job = None  # a local job's station is briefly unreachable: keep polling until the deadline
+            if job is not None:
+                if job.is_final:
+                    return job
+                last = job
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise WaitTimeoutError(f"Job {job_id} is still {job.status} after {timeout:g}s.", job=job)
+                status = last.status if last is not None else "unknown"
+                raise WaitTimeoutError(f"Job {job_id} is still {status} after {timeout:g}s.", job=last)
             self._c._sleep(min(interval, remaining))
 
     # Convenience helpers (same as on the client).

@@ -12,6 +12,9 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 import pytest
 
+# Fakes for the local printing tests (TLS station, cloud, mDNS responder) and their fixtures.
+pytest_plugins = ["localfakes"]
+
 ORG = "11111111-1111-4111-8111-111111111111"
 KEY = "cz_test_unitTESTsecretVALUE_0123456789abcdef"
 
